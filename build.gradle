@@ -1,0 +1,41 @@
+plugins {
+	id 'java'
+}
+
+repositories {
+	mavenLocal()
+	maven {
+		url = 'https://repo.runelite.net'
+	}
+	mavenCentral()
+}
+
+def runeLiteVersion = 'latest.release'
+
+dependencies {
+	compileOnly group: 'net.runelite', name:'client', version: runeLiteVersion
+
+	compileOnly 'org.projectlombok:lombok:1.18.4'
+	annotationProcessor 'org.projectlombok:lombok:1.18.4'
+
+	testImplementation 'junit:junit:4.12'
+	testImplementation group: 'net.runelite', name:'client', version: runeLiteVersion
+}
+
+group = 'com.playtimetracker'
+version = '1.1.0'
+sourceCompatibility = '11'
+
+tasks.withType(JavaCompile) {
+	options.encoding = 'UTF-8'
+}
+
+// Launches a RuneLite dev client with this plugin loaded (uses your normal ~/.runelite).
+// Developer mode is required so RuneLite loads the plugin.
+tasks.register('run', JavaExec) {
+	dependsOn 'testClasses'
+	classpath = sourceSets.test.runtimeClasspath
+	getMainClass().set('com.playtimetracker.PlayTimePluginTest')
+	jvmArgs '-ea'
+	args '--developer-mode', '--debug'
+}
