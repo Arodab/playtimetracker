@@ -4,10 +4,76 @@ import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
 import net.runelite.client.config.ConfigSection;
+import net.runelite.client.config.Range;
+
+import java.awt.Color;
 
 @ConfigGroup("play-time")
 public interface PlayTimeConfig extends Config
 {
+	@ConfigSection(
+			name = "Calendar",
+			description = "When a day rolls over, and which day a week starts on",
+			position = 5
+	)
+	String calendarSection = "calendar";
+
+	@ConfigSection(
+			name = "Daily chart",
+			description = "The bar chart of recent days shown in the side panel",
+			position = 8
+	)
+	String chartSection = "chart";
+
+	@ConfigItem(
+			keyName = "weekStart",
+			name = "Week starts on",
+			description = "The day 'This week' counts from",
+			section = calendarSection,
+			position = 2
+	)
+	default WeekStart weekStart()
+	{
+		return WeekStart.LOCALE;
+	}
+
+	@ConfigItem(
+			keyName = "showChart",
+			name = "Show daily chart",
+			description = "Draws a bar chart of the last few days under the stats",
+			section = chartSection,
+			position = 1
+	)
+	default boolean showChart()
+	{
+		return true;
+	}
+
+	@Range(min = 5, max = 60)
+	@ConfigItem(
+			keyName = "chartDays",
+			name = "Days shown",
+			description = "How many days the chart covers, ending today",
+			section = chartSection,
+			position = 2
+	)
+	default int chartDays()
+	{
+		return 14;
+	}
+
+	@ConfigItem(
+			keyName = "chartColour",
+			name = "Bar colour",
+			description = "Colour of the chart bars",
+			section = chartSection,
+			position = 3
+	)
+	default Color chartColour()
+	{
+		return new Color(0xDC, 0x8A, 0x1E);
+	}
+
 	@ConfigSection(
 			name = "On-screen overlay",
 			description = "Show any of the stats individually as a movable on-screen overlay",

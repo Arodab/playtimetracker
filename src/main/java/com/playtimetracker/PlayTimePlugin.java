@@ -26,10 +26,12 @@ import net.runelite.client.util.ImageUtil;
 import java.awt.image.BufferedImage;
 import java.time.DayOfWeek;
 import java.time.LocalDate;
+import java.time.DateTimeException;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.time.temporal.TemporalAdjusters;
-import java.time.temporal.WeekFields;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -41,7 +43,7 @@ import java.util.regex.Pattern;
 
 @Slf4j
 @PluginDescriptor(
-	name = "Play Time Tracker"
+	name = PluginName.VALUE
 )
 public class PlayTimePlugin extends Plugin
 {
@@ -54,6 +56,8 @@ public class PlayTimePlugin extends Plugin
 	public static final String GAME_TOTAL_KEY = "GAMETOTAL";
 	/** Chat command to wipe the current character's data: {@code ::resetplaytime confirm}. */
 	private static final String RESET_COMMAND = "resetplaytime";
+	/** Chat command that reports exactly when the tracked day rolls over: {@code ::playtimedebug}. */
+	private static final String DEBUG_COMMAND = "playtimedebug";
 
 	// e.g. "Time Played: 1378 days, 14 hours"
 	private static final Pattern TIME_PLAYED_PATTERN =
@@ -61,6 +65,13 @@ public class PlayTimePlugin extends Plugin
 	// Sanity ceiling for the playtime varc read as minutes (~114 years) — rejects nonsense values.
 	private static final long MAX_SANE_PLAYTIME_MINUTES = 60_000_000L;
 	private static final int LOGIN_READ_TRIES = 30;
+	/** 100 ticks a minute, and the resolution the game's own Time Played is reported at. */
+	private static final long TICKS_PER_MINUTE = 100L;
+	/**
+	 * Ceiling on a single credited login/loading gap, in ticks (5 minutes). A stalled connect or a
+	 * machine coming back from sleep must not inject a huge block of time nobody played.
+	 */
+	private static final long MAX_GAP_TICKS = 5 * TICKS_PER_MINUTE;
 
 	private boolean loadedData = false;
 	private String currentPlayer = null;
@@ -72,9 +83,46 @@ public class PlayTimePlugin extends Plugin
 
 	// Cached period totals, recomputed once per tick so the panel and overlay read them cheaply.
 	private long todayTicks = 0;
+	// Previous observation of today's total, to catch it going backwards within a single day.
+	private long lastTodayTicks = 0;
+	private String lastTodayKey = null;
+	private long lastDropMessageMs = 0;
+	// When this client last saw the date key change, and what it changed from. Null until seen.
+	private ZonedDateTime lastRolloverAt = null;
+	private String lastRolloverFrom = null;
+	/** Wall clock at the moment we left LOGGED_IN for a login or an in-session load, else 0. */
+	private long gapStartMs = 0;
+	/** Ticks owed for that gap, credited on the first tick once records are loaded. */
+	private long pendingGapTicks = 0;
+	private static final long DROP_MESSAGE_COOLDOWN_MS = 60_000L;
 	private long weekTicks = 0;
 	private long monthTicks = 0;
 	private long yearTicks = 0;
+
+	/**
+	 * The zone that decides when a day rolls over: whatever this computer reports. Kept as a
+	 * method rather than inlining {@code ZoneId.systemDefault()} at each call site so there is one
+	 * definition of "today", and so {@code ::playtimedebug} reports the same value the records use.
+	 */
+	public ZoneId zone() {
+		return ZoneId.systemDefault();
+	}
+
+	/** Today's date in the configured zone. Every day key in the records map comes from here. */
+	public LocalDate today() {
+		return LocalDate.now(zone());
+	}
+
+	/** The day "This week" counts from. */
+	public DayOfWeek firstDayOfWeek() {
+		return config.weekStart().resolve();
+	}
+
+	/** Tracked ticks recorded on the given day, or 0. Used by the chart. */
+	public long ticksOn(LocalDate date) {
+		final PlayTimeRecord r = records.get(date.format(DATE_FORMAT));
+		return r == null ? 0 : r.getTime();
+	}
 
 	public long getSessionTicks() {
 		return sessionTicks;
@@ -99,9 +147,40 @@ public class PlayTimePlugin extends Plugin
 		return sum;
 	}
 
-	/** Off-client time accumulated since this plugin started tracking (mobile, other clients, plugin off). */
+	/**
+	 * Off-client time accumulated since this plugin started tracking (mobile, other clients,
+	 * plugin off).
+	 *
+	 * <p>Reported to the minute, and zero below that, because it cannot be known more precisely
+	 * than that. The baseline is {@code gameTicks - trackedSum}, where the game total arrives as
+	 * whole minutes while the tracked sum advances every tick — so the baseline sawtooths by up to
+	 * a minute between varc updates, and PREINSTALL was captured at an arbitrary point on that
+	 * sawtooth. Subtracting the two leaves up to a minute of phase difference that is not play
+	 * time. Reporting it raw showed 47s of "mobile" on an account that had never left the client.
+	 */
 	public long getExternalSinceInstallTicks() {
-		return Math.max(0, recordTicks(EXTERNAL_TIME_KEY) - recordTicks(PRE_INSTALL_KEY));
+		final long raw = recordTicks(EXTERNAL_TIME_KEY) - recordTicks(PRE_INSTALL_KEY);
+		if (raw < TICKS_PER_MINUTE) {
+			return 0;
+		}
+		return raw - (raw % TICKS_PER_MINUTE);
+	}
+
+	/** Off-client time per calendar day since tracking began. */
+	public long getExternalAvgTicks() {
+		return getExternalSinceInstallTicks() / getDaysSinceTrackingStarted();
+	}
+
+	/** Time that existed before this plugin ever ran — the game's total at first sync. */
+	public long getPreInstallTicks() {
+		return recordTicks(PRE_INSTALL_KEY);
+	}
+
+	/** Share of time since install that happened off this client, 0-100. */
+	public int getExternalSharePercent() {
+		final long external = getExternalSinceInstallTicks();
+		final long total = external + getTrackedTicks();
+		return total == 0 ? 0 : (int) Math.round(external * 100.0 / total);
 	}
 
 	/** Calendar days from the first tracked day to today (inclusive), at least 1. */
@@ -119,7 +198,7 @@ public class PlayTimePlugin extends Plugin
 		if (earliest == null) {
 			return 1;
 		}
-		return Math.max(1, ChronoUnit.DAYS.between(earliest, LocalDate.now()) + 1);
+		return Math.max(1, ChronoUnit.DAYS.between(earliest, today()) + 1);
 	}
 
 	public long getTodayTicks() {
@@ -139,18 +218,18 @@ public class PlayTimePlugin extends Plugin
 	}
 
 	public long getWeekAvgTicks() {
-		final LocalDate today = LocalDate.now();
-		final LocalDate start = today.with(TemporalAdjusters.previousOrSame(WeekFields.of(Locale.getDefault()).getFirstDayOfWeek()));
+		final LocalDate today = today();
+		final LocalDate start = today.with(TemporalAdjusters.previousOrSame(firstDayOfWeek()));
 		return weekTicks / periodDays(start, today);
 	}
 
 	public long getMonthAvgTicks() {
-		final LocalDate today = LocalDate.now();
+		final LocalDate today = today();
 		return monthTicks / periodDays(today.withDayOfMonth(1), today);
 	}
 
 	public long getYearAvgTicks() {
-		final LocalDate today = LocalDate.now();
+		final LocalDate today = today();
 		return yearTicks / periodDays(today.withDayOfYear(1), today);
 	}
 
@@ -166,8 +245,21 @@ public class PlayTimePlugin extends Plugin
 	private void updateStatCache() {
 		final PlayTimeRecord rec = getCurrentRecord();
 		todayTicks = rec == null ? 0 : rec.getTime();
-		final LocalDate today = LocalDate.now();
-		final DayOfWeek firstDay = WeekFields.of(Locale.getDefault()).getFirstDayOfWeek();
+		final LocalDate today = today();
+		final String todayKey = today.format(DATE_FORMAT);
+		// Today's total only ever climbs within a day. A drop with the date unchanged means the
+		// record was replaced or the map rebuilt underneath us — which is the "random reset" users
+		// report and nothing else here can see. WARN so it reaches a hub user's log without --debug.
+		if (todayKey.equals(lastTodayKey) && todayTicks < lastTodayTicks) {
+			log.warn("Play Time Tracker: today's total DROPPED {} -> {} on {} "
+							+ "(records={}, keys={}, player={}, session={}, loaded={})",
+					lastTodayTicks, todayTicks, todayKey, records.size(), records.keySet(),
+					debugName(currentPlayer), sessionTicks, loadedData);
+			notifyDrop(lastTodayTicks, todayTicks);
+		}
+		lastTodayKey = todayKey;
+		lastTodayTicks = todayTicks;
+		final DayOfWeek firstDay = firstDayOfWeek();
 		weekTicks = ticksBetweenDates(today.with(TemporalAdjusters.previousOrSame(firstDay)), today);
 		monthTicks = ticksBetweenDates(today.withDayOfMonth(1), today);
 		yearTicks = ticksBetweenDates(today.withDayOfYear(1), today);
@@ -223,6 +315,30 @@ public class PlayTimePlugin extends Plugin
 	private PlayTimeRecord record;
 	public Map<String, PlayTimeRecord> records = new ConcurrentHashMap<>();
 
+	// --- TEMPORARY DIAGNOSTIC (remove once the "random reset" report is settled) ---
+	/** Renders a name so invisible differences (nbsp, tabs, trailing space) show up in the log. */
+	private static String debugName(String s)
+	{
+		if (s == null)
+		{
+			return "<null>";
+		}
+		final StringBuilder sb = new StringBuilder("\"");
+		for (int i = 0; i < s.length(); i++)
+		{
+			final char c = s.charAt(i);
+			if (c < 0x20 || c > 0x7E)
+			{
+				sb.append(String.format("\\u%04X", (int) c));
+			}
+			else
+			{
+				sb.append(c);
+			}
+		}
+		return sb.append('"').toString();
+	}
+
 	@Override
 	protected void startUp() throws Exception
 	{
@@ -239,6 +355,11 @@ public class PlayTimePlugin extends Plugin
 
 		clientToolbar.addNavigation(navButton);
 		overlayManager.add(overlay);
+
+		log.debug("Play Time Tracker: startUp zone={} (system {}) offset={} weekStartsOn={} today={}",
+				zone(), ZoneId.systemDefault(),
+				zone().getRules().getOffset(java.time.Instant.now()),
+				firstDayOfWeek(), today().format(DATE_FORMAT));
 
 		if (client.getGameState() == GameState.LOGGED_IN)
 		{
@@ -282,14 +403,44 @@ public class PlayTimePlugin extends Plugin
 		}
 		if (!name.equals(currentPlayer))
 		{
-			loadDataFor(name);
+			try
+			{
+				loadDataFor(name);
+			}
+			catch (Exception ex)
+			{
+				// A throw here repeats every tick and stops the counter dead, because it lands
+				// before sessionTicks++ (see CRASH_NOTES.md). Carry on with an empty set instead;
+				// the writer refuses to persist over a file it could not read, so nothing is lost.
+				log.warn("Play Time Tracker: could not load data for {}, tracking from empty",
+						debugName(name), ex);
+				currentPlayer = name;
+				loadedData = true;
+			}
 		}
 
 		sessionTicks++;
 		totalTicks++;
 
 		final PlayTimeRecord rec = getCurrentRecord();
+		if (rec == null)
+		{
+			// No record to bill this tick to, but the session counter still runs, so the panel
+			// shows the tracker is alive rather than sitting on "Login for times to be displayed".
+			panel.showView();
+			return;
+		}
 		rec.setTime(rec.getTime() + 1);
+
+		if (pendingGapTicks > 0)
+		{
+			// Time spent logging in or loading, now that there is a record to bill it to.
+			rec.setTime(rec.getTime() + pendingGapTicks);
+			sessionTicks += pendingGapTicks;
+			totalTicks += pendingGapTicks;
+			log.debug("Play Time Tracker: credited {} ticks of login/loading time", pendingGapTicks);
+			pendingGapTicks = 0;
+		}
 
 		// Read the account-summary total after tracking, and never let it block tracking.
 		if (pendingSummaryRead && config.countExternalTime())
@@ -325,14 +476,29 @@ public class PlayTimePlugin extends Plugin
 		if (!loadedData) {
 			return null;
 		}
-		final String today = LocalDate.now().format(DATE_FORMAT);
+		final String today = today().format(DATE_FORMAT);
 		if (record != null && today.equals(record.getDate())) {
 			return record;
 		}
 		PlayTimeRecord rec = records.get(today);
 		if (rec == null) {
+			// This is the exact moment "Today" goes to zero. Log why.
+			log.debug("Play Time Tracker: minting NEW record for {} (previous cached record={}, "
+							+ "records held={}, keys={}, player={})",
+					today,
+					record == null ? "<none>" : record.getDate() + "=" + record.getTime(),
+					records.size(), records.keySet(), debugName(currentPlayer));
 			rec = new PlayTimeRecord(today, 0);
 			records.put(rec.getDate(), rec);
+		}
+		if (record != null && !record.getDate().equals(rec.getDate())) {
+			// The day actually turned over while this client was watching. That wall-clock time is
+			// the one worth reporting: it is when the reset was *observed*, not when the calendar
+			// says it should have happened, and a gap between the two is the bug users report.
+			lastRolloverAt = ZonedDateTime.now(zone());
+			lastRolloverFrom = record.getDate();
+			log.info("Play Time Tracker: day rolled over {} -> {} at {}",
+					lastRolloverFrom, rec.getDate(), lastRolloverAt.toLocalTime());
 		}
 		record = rec;
 		return rec;
@@ -359,8 +525,20 @@ public class PlayTimePlugin extends Plugin
 				totalTicks += rec.getTime();
 			}
 		}
+		// A file from the original Play Time plugin carries OLD but neither PREINSTALL nor
+		// GAMETOTAL. With no PREINSTALL to subtract, the entire pre-plugin lifetime is reported as
+		// off-client time. Seed it from OLD: at the moment of migration, none of that baseline had
+		// accrued since this plugin started tracking. Without an Account Summary read to capture it
+		// later — which never happens if "Count time outside RuneLite" is off — it stays wrong.
+		if (records.get(PRE_INSTALL_KEY) == null && records.get(EXTERNAL_TIME_KEY) != null) {
+			setSpecialRecord(PRE_INSTALL_KEY, recordTicks(EXTERNAL_TIME_KEY));
+			log.debug("Play Time Tracker: {} had OLD without PREINSTALL (migrated file); seeded PREINSTALL={}",
+					debugName(player), recordTicks(PRE_INSTALL_KEY));
+		}
 		currentPlayer = player;
 		loadedData = true;
+		log.debug("Play Time Tracker: loadDataFor({}) read {} records, tracked={}, keys={}",
+				debugName(player), recs.size(), getTrackedTicks(), records.keySet());
 	}
 
 	public void saveData() {
@@ -374,8 +552,37 @@ public class PlayTimePlugin extends Plugin
 	public void onGameStateChanged(GameStateChanged event)
 	{
 		GameState state = event.getGameState();
+		// The game's Time Played covers logging in and loading; GameTick does not fire during
+		// either, so that time has to be measured on the wall clock instead of counted. Without
+		// it the plugin runs ~17s short per session, and that shortfall surfaces as phantom
+		// off-client time once a few sessions have accumulated past a minute.
+		if (state == GameState.LOGGING_IN || state == GameState.LOADING
+				|| state == GameState.HOPPING)
+		{
+			if (gapStartMs == 0)
+			{
+				gapStartMs = System.currentTimeMillis();
+			}
+		}
+		else if (state != GameState.LOGGED_IN)
+		{
+			// LOGIN_SCREEN, CONNECTION_LOST and friends: not in game, and the server may have
+			// ended the session. Discard rather than guess.
+			gapStartMs = 0;
+		}
+
 		if (state == GameState.LOGGED_IN)
 		{
+			if (gapStartMs > 0)
+			{
+				final long elapsed = (System.currentTimeMillis() - gapStartMs) / 600L;
+				gapStartMs = 0;
+				if (elapsed > 0)
+				{
+					// Credited on the next tick: records are not loaded yet at this point.
+					pendingGapTicks += Math.min(elapsed, MAX_GAP_TICKS);
+				}
+			}
 			// Try reading total play time shortly after login (the varc is populated for the
 			// in-game play-time reminder), so we can sync without opening the summary panel.
 			pendingSummaryRead = true;
@@ -385,9 +592,15 @@ public class PlayTimePlugin extends Plugin
 		{
 			// Persist the current character, then clear state so the next login loads
 			// the correct character's data instead of mixing characters together.
+			log.debug("Play Time Tracker: LOGIN_SCREEN clearing all state for {} (today={}, tracked={})",
+					debugName(currentPlayer),
+					record == null ? "<none>" : record.getDate() + "=" + record.getTime(),
+					getTrackedTicks());
 			saveData();
 			sessionTicks = 0;
 			loadedData = false;
+			// Drop any uncredited login/loading gap: we never reached the game, so it was not play.
+			pendingGapTicks = 0;
 			pendingSummaryRead = false;
 			summaryReadTries = 0;
 			currentPlayer = null;
@@ -414,6 +627,11 @@ public class PlayTimePlugin extends Plugin
 	@Subscribe
 	public void onCommandExecuted(CommandExecuted event)
 	{
+		if (DEBUG_COMMAND.equalsIgnoreCase(event.getCommand()))
+		{
+			printDayBoundaryDebug();
+			return;
+		}
 		if (!RESET_COMMAND.equalsIgnoreCase(event.getCommand()))
 		{
 			return;
@@ -434,6 +652,92 @@ public class PlayTimePlugin extends Plugin
 			saveData();
 		}
 		addGameMessage("Play Time Tracker: tracker reset" + (who != null ? " for " + who : "") + ".");
+	}
+
+	/**
+	 * Says it in chat as well as the log. Most users will never open client.log, so an anomaly that
+	 * only ever appears there is invisible to exactly the people who can report it. Throttled hard:
+	 * this runs off a per-tick check, and a stuck condition would otherwise spam every 600ms.
+	 */
+	private void notifyDrop(long from, long to)
+	{
+		final long now = System.currentTimeMillis();
+		if (now - lastDropMessageMs < DROP_MESSAGE_COOLDOWN_MS)
+		{
+			return;
+		}
+		lastDropMessageMs = now;
+		addGameMessage("Play Time Tracker: today's tracked time went backwards ("
+				+ formatTicks(from) + " -> " + formatTicks(to)
+				+ "). This is a bug - please report it with your client log.");
+	}
+
+	/**
+	 * Answers "why did my day reset then?" in chat, without a log file.
+	 *
+	 * <p>The plugin's day comes from the JVM's zone, and that is not always the zone on the
+	 * taskbar: Windows maps its registry zone through the JRE's bundled tzdb, and when that
+	 * mapping fails Java quietly falls back to a fixed offset with no DST rules. The clock stays
+	 * right and the date boundary moves, usually by an hour. Printing the JVM's idea of the wall
+	 * clock next to the next rollover makes that visible in one line.
+	 */
+	private void printDayBoundaryDebug()
+	{
+		for (String line : dayBoundaryLines())
+		{
+			addGameMessage(line);
+		}
+
+		final ZoneId z = zone();
+		final ZonedDateTime now = ZonedDateTime.now(z);
+		log.info("Play Time Tracker: debug zone={} offset={} now={} today={} dayBeganAt={} "
+						+ "rollsOverAt={} weekStartsOn={} lastSeenRollover={} from={}",
+				z, now.getOffset(), now.toLocalTime(), now.toLocalDate(),
+				now.toLocalDate().atStartOfDay(z), now.toLocalDate().plusDays(1).atStartOfDay(z),
+				firstDayOfWeek(), lastRolloverAt, lastRolloverFrom);
+	}
+
+	/** The {@code ::playtimedebug} text, separated from sending it so it can be checked offline. */
+	List<String> dayBoundaryLines()
+	{
+		final ZoneId z = zone();
+		final ZonedDateTime now = ZonedDateTime.now(z);
+		final ZonedDateTime dayStart = now.toLocalDate().atStartOfDay(z);
+		final ZonedDateTime rollover = now.toLocalDate().plusDays(1).atStartOfDay(z);
+		final long sinceStart = ChronoUnit.MINUTES.between(dayStart, now);
+		final long minutesLeft = ChronoUnit.MINUTES.between(now, rollover);
+		final LocalDate weekStart = now.toLocalDate()
+				.with(TemporalAdjusters.previousOrSame(firstDayOfWeek()));
+
+		final List<String> lines = new ArrayList<>();
+		lines.add("Play Time Tracker: clock reads "
+				+ now.toLocalTime().truncatedTo(ChronoUnit.SECONDS)
+				+ " in " + z + " (UTC" + now.getOffset() + ").");
+		lines.add("Today is " + now.toLocalDate() + ": began at " + dayStart.toLocalTime()
+				+ " (" + hm(sinceStart) + " ago), next reset at "
+				+ rollover.toLocalTime() + " in " + hm(minutesLeft) + ".");
+
+		if (lastRolloverAt == null)
+		{
+			lines.add("This client has not seen a day reset yet - it has not been running across "
+					+ "one. Today's record was loaded, not rolled.");
+		}
+		else
+		{
+			lines.add("Last reset actually seen: " + lastRolloverFrom + " -> "
+					+ lastRolloverAt.toLocalDate() + " at " + lastRolloverAt.toLocalTime()
+					+ " (" + hm(ChronoUnit.MINUTES.between(lastRolloverAt, now)) + " ago). "
+					+ "That should read " + dayStart.toLocalTime() + " - if it does not, that is the bug.");
+		}
+		lines.add("Week starts " + firstDayOfWeek() + ", so this week runs from " + weekStart + ".");
+		lines.add("If that clock time does not match your own, the day will reset at the wrong "
+				+ "hour - report it with these lines.");
+		return lines;
+	}
+
+	private static String hm(long minutes)
+	{
+		return (minutes / 60) + "h " + (minutes % 60) + "m";
 	}
 
 	private void addGameMessage(String message)

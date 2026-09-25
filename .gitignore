@@ -9,3 +9,9 @@ nb-configuration.xml
 nbproject/
 .DS_Store
 package.gradle
+# Local-only: contain machine paths and the maintainer's email, must not reach a public repo
+SUBMISSION.md
+launch-dev-client.cmd
+CRASH_NOTES.md
+*.jar
+!gradle/wrapper/gradle-wrapper.jar

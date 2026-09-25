@@ -4,6 +4,8 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.PluginPanel;
 import net.runelite.client.ui.components.PluginErrorPanel;
+import net.runelite.client.ui.components.materialtabs.MaterialTab;
+import net.runelite.client.ui.components.materialtabs.MaterialTabGroup;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
@@ -30,12 +32,22 @@ public class PlayTimePanel extends PluginPanel {
     private final JLabel externalTime = new JLabel();
     private final JLabel totalTime = new JLabel();
 
+    private final JLabel mobileTotal = new JLabel();
+    private final JLabel mobileAverage = new JLabel();
+    private final JLabel mobileShare = new JLabel();
+    private final JLabel mobileTracked = new JLabel();
+    private final JLabel mobilePreInstall = new JLabel();
+    private final JLabel mobileInGame = new JLabel();
+
     private boolean shown = false;
+    private final PlayTimeChart chart;
+    private final JPanel chartHolder = new JPanel(new BorderLayout());
 
     public PlayTimePanel(final PlayTimePlugin plugin)
     {
         super(false);
         this.plugin = plugin;
+        this.chart = new PlayTimeChart(plugin);
         setBackground(BACKGROUND_COLOR);
         setLayout(new BorderLayout());
     }
@@ -75,6 +87,56 @@ public class PlayTimePanel extends PluginPanel {
         addPrimary(stats, externalTime);
         addPrimary(stats, totalTime);
 
+        chartHolder.setBackground(BACKGROUND_COLOR);
+        chartHolder.setBorder(new EmptyBorder(12, 0, 0, 0));
+        chartHolder.add(chart, BorderLayout.CENTER);
+        chartHolder.setAlignmentX(Component.LEFT_ALIGNMENT);
+        stats.add(chartHolder);
+
+        // Mobile tab: everything the plugin knows that did NOT happen in this client.
+        final JPanel mobile = new JPanel();
+        mobile.setLayout(new BoxLayout(mobile, BoxLayout.Y_AXIS));
+        mobile.setBackground(BACKGROUND_COLOR);
+        mobile.setBorder(new EmptyBorder(10, 12, 10, 12));
+
+        addPrimary(mobile, mobileTotal);
+        addSub(mobile, mobileAverage);
+        mobile.add(Box.createVerticalStrut(10));
+        addPrimary(mobile, mobileShare);
+        addSub(mobile, mobileTracked);
+        mobile.add(Box.createVerticalStrut(10));
+        addPrimary(mobile, mobilePreInstall);
+        addSub(mobile, mobileInGame);
+        mobile.add(Box.createVerticalStrut(12));
+
+        final JLabel mobileNote = new JLabel("<html><body style='width:158px'>"
+                + "Off-client time is the gap between the game's own Time Played and what this "
+                + "plugin tracked - mobile, other clients, or the plugin switched off. It also "
+                + "picks up logging in and loading, which the game counts and this plugin does "
+                + "not, so expect a little even if you never leave the client. Reported to the "
+                + "minute, because the game's total is. Needs 'Count time outside RuneLite' on."
+                + "</body></html>");
+        mobileNote.setForeground(Color.GRAY);
+        mobileNote.setAlignmentX(Component.LEFT_ALIGNMENT);
+        mobile.add(mobileNote);
+
+        final JScrollPane timeTab = wrapContainer(stats);
+        final JScrollPane mobileTab = wrapContainer(mobile);
+        // Do NOT hide the unselected tab: MaterialTabGroup.select swaps the display's children
+        // with removeAll/add and never restores visibility, so a hidden tab stays blank forever.
+
+        final JPanel tabContent = new JPanel(new BorderLayout());
+        tabContent.setBackground(BACKGROUND_COLOR);
+        tabContent.add(timeTab, BorderLayout.CENTER);
+
+        final MaterialTabGroup tabGroup = new MaterialTabGroup(tabContent);
+        tabGroup.setBorder(new EmptyBorder(4, 12, 0, 12));
+        final MaterialTab timeTabButton = new MaterialTab("Play time", tabGroup, timeTab);
+        final MaterialTab mobileTabButton = new MaterialTab("Mobile", tabGroup, mobileTab);
+        tabGroup.addTab(timeTabButton);
+        tabGroup.addTab(mobileTabButton);
+        tabGroup.select(timeTabButton);
+
         final JButton exportButton = new JButton("Export daily CSV");
         exportButton.setAlignmentX(Component.CENTER_ALIGNMENT);
         exportButton.addActionListener(e -> exportCsv());
@@ -91,8 +153,13 @@ public class PlayTimePanel extends PluginPanel {
         buttons.add(Box.createVerticalStrut(6));
         buttons.add(resetButton);
 
-        add(errorPanel, BorderLayout.NORTH);
-        add(wrapContainer(stats), BorderLayout.CENTER);
+        final JPanel header = new JPanel(new BorderLayout());
+        header.setBackground(BACKGROUND_COLOR);
+        header.add(errorPanel, BorderLayout.NORTH);
+        header.add(tabGroup, BorderLayout.SOUTH);
+
+        add(header, BorderLayout.NORTH);
+        add(tabContent, BorderLayout.CENTER);
         add(buttons, BorderLayout.SOUTH);
 
         revalidate();
@@ -116,6 +183,14 @@ public class PlayTimePanel extends PluginPanel {
 
     public void updateTimes()
     {
+        final boolean wantChart = plugin.getConfig().showChart();
+        if (chartHolder.isVisible() != wantChart) {
+            chartHolder.setVisible(wantChart);
+        }
+        if (wantChart) {
+            chart.refresh();
+        }
+
         if (plugin.getSessionTicks() == 0) {
             sessionTime.setText("Login for times to be displayed");
             dayTime.setText("");
@@ -131,6 +206,8 @@ public class PlayTimePanel extends PluginPanel {
             totalTime.setText("");
             return;
         }
+
+        updateMobile();
 
         final PlayTimeRecord rec = plugin.getCurrentRecord();
         sessionTime.setText("Session: " + (rec != null ? plugin.formatTicks(plugin.getSessionTicks()) : "?"));
@@ -169,6 +246,44 @@ public class PlayTimePanel extends PluginPanel {
         } else {
             clearAverages();
         }
+    }
+
+    /** The Mobile tab. Driven off the same records, so it needs no state of its own. */
+    private void updateMobile()
+    {
+        if (plugin.getCurrentPlayer() == null) {
+            mobileTotal.setText("Off-client: log in to see");
+            mobileAverage.setText("");
+            mobileShare.setText("");
+            mobileTracked.setText("");
+            mobilePreInstall.setText("");
+            mobileInGame.setText("");
+            return;
+        }
+
+        if (!plugin.getConfig().countExternalTime()) {
+            mobileTotal.setText("Off-client tracking is off");
+            mobileAverage.setText("Enable 'Count time outside RuneLite'");
+            mobileShare.setText("");
+            mobileTracked.setText("");
+            mobilePreInstall.setText("");
+            mobileInGame.setText("");
+            return;
+        }
+
+        final long external = plugin.getExternalSinceInstallTicks();
+        if (external == 0) {
+            mobileTotal.setText("Off-client: none detected");
+            mobileAverage.setText("under a minute is not counted");
+        } else {
+            mobileTotal.setText("Off-client: " + plugin.formatTicks(external));
+            mobileAverage.setText("avg/day: " + plugin.formatTicks(plugin.getExternalAvgTicks())
+                    + "  (over " + plugin.getDaysSinceTrackingStarted() + "d)");
+        }
+        mobileShare.setText("Share of play: " + plugin.getExternalSharePercent() + "% off-client");
+        mobileTracked.setText("in RuneLite: " + plugin.formatTicks(plugin.getTrackedTicks()));
+        mobilePreInstall.setText("Before this plugin: " + plugin.formatTicks(plugin.getPreInstallTicks()));
+        mobileInGame.setText("Game total: " + plugin.formatTicks(plugin.getTotalTicks()));
     }
 
     private void clearAverages()
