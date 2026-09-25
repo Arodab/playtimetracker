@@ -43,7 +43,7 @@ import java.util.regex.Pattern;
 
 @Slf4j
 @PluginDescriptor(
-	name = PluginName.VALUE
+	name = "Play Time Tracker"
 )
 public class PlayTimePlugin extends Plugin
 {
